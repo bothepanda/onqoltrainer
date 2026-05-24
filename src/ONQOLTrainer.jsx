@@ -262,20 +262,11 @@ export default function ONQOLTrainer() {
     setLoading(true);
 
     try {
-      const initMessages = [{ role: "user", content: "Начинаем сессию." }];
-      const greeting = await callClaude(initMessages);
-      const afterGreeting = [
-        ...initMessages,
-        { role: "assistant", content: greeting },
-        { role: "user", content: category.prompt },
-      ];
-      const firstCase = await callClaude(afterGreeting);
+      const initMessages = [{ role: "user", content: `Начинаем сессию. ${category.prompt}` }];
+      const firstReply = await callClaude(initMessages);
 
-      setMessages([
-        { role: "assistant", content: greeting },
-        { role: "assistant", content: firstCase },
-      ]);
-      window.__onqolHistory = [...afterGreeting, { role: "assistant", content: firstCase }];
+      setMessages([{ role: "assistant", content: firstReply }]);
+      window.__onqolHistory = [...initMessages, { role: "assistant", content: firstReply }];
     } catch (err) {
       setError(err.message);
       setPhase("start");
