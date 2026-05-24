@@ -83,7 +83,7 @@ const SYSTEM_PROMPT = `# System Prompt — Тренажёр клинически
 A. Что было сделано правильно — конкретно, не формально
 B. Что пропущено или сделано неоптимально — без осуждения, с клиническим reasoning
 C. Ключевой обучающий момент — одна главная мысль
-D. Дополнительное чтение — 2–3 источника (WSES, ESCP, UpToDate-тематика). Не генерируй несуществующие ссылки.
+D. Дополнительное чтение — 2–3 источника строго из следующего списка официальных гайдлайнов: WSES (World Society of Emergency Surgery), ESCP (European Society of Coloproctology), ESSES (European Society for Surgical Endoscopy), EAES, ACS TQIP / ATLS, WHO Surgical Safety Checklist, ERAS Society guidelines, European Hernia Society (EHS), ESGE (эндоскопия). Указывай только реальные документы с годом публикации. Не генерируй несуществующие ссылки и не ссылайся на UpToDate — это платная база, не публичный гайдлайн.
 
 ---
 
@@ -217,7 +217,7 @@ export default function ONQOLTrainer() {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 1000,
+        max_tokens: 2000,
         system: SYSTEM_PROMPT,
         messages: history,
       }),
@@ -262,11 +262,20 @@ export default function ONQOLTrainer() {
     setLoading(true);
 
     try {
-      const initMessages = [{ role: "user", content: `Начинаем сессию. ${category.prompt}` }];
-      const firstReply = await callClaude(initMessages);
+      const initMessages = [{ role: "user", content: "Начинаем сессию." }];
+      const greeting = await callClaude(initMessages);
+      const afterGreeting = [
+        ...initMessages,
+        { role: "assistant", content: greeting },
+        { role: "user", content: category.prompt },
+      ];
+      const firstCase = await callClaude(afterGreeting);
 
-      setMessages([{ role: "assistant", content: firstReply }]);
-      window.__onqolHistory = [...initMessages, { role: "assistant", content: firstReply }];
+      setMessages([
+        { role: "assistant", content: greeting },
+        { role: "assistant", content: firstCase },
+      ]);
+      window.__onqolHistory = [...afterGreeting, { role: "assistant", content: firstCase }];
     } catch (err) {
       setError(err.message);
       setPhase("start");
