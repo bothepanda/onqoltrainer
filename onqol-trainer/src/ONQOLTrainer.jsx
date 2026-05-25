@@ -1,6 +1,54 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 
+// ─── Case history (Vercel Blob via /api/history) ───────────────────────────
+function getUserId(apiKey) {
+  if (!apiKey) return null;
+  let h = 5381;
+  for (let i = 0; i < apiKey.length; i++) {
+    h = ((h << 5) + h) ^ apiKey.charCodeAt(i);
+  }
+  return (h >>> 0).toString(36).padStart(8, "0");
+}
+
+async function apiFetchHistory(uid) {
+  try {
+    const r = await fetch(`/api/history?uid=${uid}`);
+    const d = await r.json();
+    return Array.isArray(d.history) ? d.history : [];
+  } catch { return []; }
+}
+
+async function apiAddCase(uid, label) {
+  try {
+    const r = await fetch(`/api/history?uid=${uid}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    });
+    const d = await r.json();
+    return Array.isArray(d.history) ? d.history : null;
+  } catch { return null; }
+}
+
+async function apiClearHistory(uid) {
+  try { await fetch(`/api/history?uid=${uid}`, { method: "DELETE" }); }
+  catch {}
+}
+
+function extractCaseLabel(text) {
+  const m = text.match(/[МЖмж]ужчина|[Жж]енщина/);
+  const age = text.match(/(\d{2,3})\s*лет/);
+  const complaint = text.match(/жалоб[аы][^.]{0,60}/i);
+  if (m && age) {
+    const who = m[0] + ", " + age[1] + " лет";
+    const what = complaint ? ", " + complaint[0].slice(0, 50) : "";
+    return (who + what).slice(0, 100);
+  }
+  return text.replace(/\n/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 const SYSTEM_PROMPT = `# System Prompt — Тренажёр клинических кейсов
 
 ## Хирургия · Казахстанский контекст · Русский язык
@@ -26,7 +74,7 @@ const SYSTEM_PROMPT = `# System Prompt — Тренажёр клинически
 - Что было пропущено или сделано неоптимально — чтобы вернуться в разборе
 - Подсказки, которые были даны — учитывай при оценке уровня
 
-В конце сессии (когда резидент говорит "всё" или "заканчиваем") — предложи резюме для сохранения.
+В конце сессии (когда резидент пишет "конец кейса") — предложи резюме для сохранения.
 
 ---
 
@@ -210,6 +258,7 @@ export default function ONQOLTrainer() {
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [error, setError] = useState("");
   const [hoveredCat, setHoveredCat] = useState(null);
+  const [caseHistory, setCaseHistory] = useState([]);
   const bottomRef = useRef(null);
   const textareaRef = useRef(null);
 
@@ -224,6 +273,12 @@ export default function ONQOLTrainer() {
     }
   }, [input]);
 
+  useEffect(() => {
+    if (!apiKey) return;
+    const uid = getUserId(apiKey);
+    apiFetchHistory(uid).then(setCaseHistory);
+  }, [apiKey]);
+
   async function callClaude(history) {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -235,7 +290,7 @@ export default function ONQOLTrainer() {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 2000,
+        max_tokens: 4096,
         system: SYSTEM_PROMPT,
         messages: history,
       }),
@@ -280,20 +335,20 @@ export default function ONQOLTrainer() {
     setLoading(true);
 
     try {
-      const initMessages = [{ role: "user", content: "Начинаем сессию." }];
-      const greeting = await callClaude(initMessages);
-      const afterGreeting = [
-        ...initMessages,
-        { role: "assistant", content: greeting },
-        { role: "user", content: category.prompt },
-      ];
-      const firstCase = await callClaude(afterGreeting);
+      const uid = getUserId(apiKey);
+      const historyNote = caseHistory.length > 0
+        ? `\n\nУже разобранные кейсы в предыдущих сессиях — обязательно избегай повторения этих нозологий и клинических сценариев: ${caseHistory.join(" | ")}.`
+        : "";
+      const initMessages = [{ role: "user", content: category.prompt + historyNote }];
+      const firstCase = await callClaude(initMessages);
 
-      setMessages([
-        { role: "assistant", content: greeting },
-        { role: "assistant", content: firstCase },
-      ]);
-      window.__onqolHistory = [...afterGreeting, { role: "assistant", content: firstCase }];
+      // Сохраняем кейс в историю (API + state)
+      const label = extractCaseLabel(firstCase);
+      const updated = await apiAddCase(uid, label);
+      if (updated) setCaseHistory(updated);
+
+      setMessages([{ role: "assistant", content: firstCase }]);
+      window.__onqolHistory = [...initMessages, { role: "assistant", content: firstCase }];
     } catch (err) {
       setError(err.message);
       setPhase("start");
@@ -321,8 +376,7 @@ export default function ONQOLTrainer() {
       window.__onqolHistory = [...newHistory, assistantMsg];
       setMessages((prev) => [...prev, assistantMsg]);
 
-      const lower = text.toLowerCase();
-      if (lower.includes("заканчиваем") || lower.includes("всё") || lower.includes("все") || lower.includes("стоп")) {
+      if (text.trim().toLowerCase() === "конец кейса") {
         setTimeout(() => generateSummary([...window.__onqolHistory, assistantMsg]), 800);
       }
     } catch (err) {
@@ -746,24 +800,47 @@ export default function ONQOLTrainer() {
         <div style={styles.logoSep} />
         <span style={styles.logoSub}>Тренажёр клинических кейсов</span>
         {apiKey && phase === "start" && (
-          <button
-            onClick={clearApiKey}
-            style={{
-              marginLeft: "auto",
-              background: "none",
-              border: "none",
-              color: C.textSub,
-              fontFamily: "'IBM Plex Mono', monospace",
-              fontSize: "12px",
-              cursor: "pointer",
-              letterSpacing: "0.05em",
-              display: "flex",
-              alignItems: "center",
-              gap: "4px",
-            }}
-          >
-            <KeyIcon /> API ключ
-          </button>
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "16px" }}>
+            {caseHistory.length > 0 && (
+              <button
+                onClick={async () => {
+                  await apiClearHistory(getUserId(apiKey));
+                  setCaseHistory([]);
+                }}
+                title="Сбросить историю кейсов"
+                style={{
+                  background: "none",
+                  border: `1px solid rgba(22,105,122,0.2)`,
+                  borderRadius: "4px",
+                  color: C.textMid,
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  letterSpacing: "0.05em",
+                  padding: "4px 10px",
+                }}
+              >
+                {caseHistory.length} кейс{caseHistory.length === 1 ? "" : caseHistory.length < 5 ? "а" : "ов"} · сбросить
+              </button>
+            )}
+            <button
+              onClick={clearApiKey}
+              style={{
+                background: "none",
+                border: "none",
+                color: C.textSub,
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: "12px",
+                cursor: "pointer",
+                letterSpacing: "0.05em",
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+            >
+              <KeyIcon /> API ключ
+            </button>
+          </div>
         )}
       </div>
 
@@ -864,7 +941,7 @@ export default function ONQOLTrainer() {
           </div>
           {error && <div style={styles.chatErrorRow}>{error}</div>}
           <div style={styles.hintRow}>
-            чтобы завершить сессию и получить резюме — напишите «заканчиваем» или «всё»
+            чтобы завершить сессию и получить резюме — напишите «конец кейса»
           </div>
           <div style={styles.inputRow}>
             <textarea
