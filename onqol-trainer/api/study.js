@@ -8,6 +8,8 @@ import { PLAN, MODE_OF_KIND, todayAlmaty } from "./_lib/plan.js";
 import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages } from "./_lib/tutor.js";
 
 const MAX_TEXT = 4000;
+// Явные команды завершения кейса, набранные текстом (кнопка «Завершить кейс» делает то же самое)
+const FINISH_RE = /^(конец кейса|завершить кейс|закончить кейс|завершить[, ]+дай разбор|дай разбор)[.!\s]*$/i;
 const MAX_TURNS = 60;
 const LOCK_AFTER = 5;
 const LOCK_MINUTES = 10;
@@ -179,7 +181,7 @@ const routes = {
     const expectedLen = Number(req.body?.expected_len);
     if (expectedLen !== a.transcript.length) fail(409, "Переписка изменилась, обновите страницу");
     if (a.transcript.filter((m) => m.role === "user").length >= MAX_TURNS) fail(429, "Достигнут лимит реплик. Завершите кейс");
-    if (text.toLowerCase() === "конец кейса") return routes["POST finish"](req, store);
+    if (FINISH_RE.test(text)) return routes["POST finish"](req, store);
 
     const kase = CASES[a.case_id];
     const userMsg = { role: "user", content: text, ts: new Date().toISOString() };
@@ -188,7 +190,8 @@ const routes = {
       messages: toApiMessages([...a.transcript, userMsg]),
     });
     const { clean, hints } = parseHints(out.text);
-    const reply = { role: "assistant", content: clean, ts: new Date().toISOString(), model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage };
+    const reply = { role: "assistant", content: clean, ts: new Date().toISOString(), model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason };
+    if (out.stop_reason === "max_tokens") reply.truncated = true;
     if (hints.length && a.mode === "tutored") reply.hints = hints;
     const n = await store.appendTurn(a.id, expectedLen, [userMsg, reply], out.model);
     if (n == null) fail(409, "Переписка изменилась, обновите страницу");
@@ -203,10 +206,11 @@ const routes = {
     const marker = { role: "user", content: "[Кейс завершён резидентом]", ts: new Date().toISOString(), kind: "finish" };
     const out = await callModel({
       system: buildSystemPrompt(kase, a.mode),
-      messages: [...toApiMessages([...a.transcript, marker]).slice(0, -1), { role: "user", content: DEBRIEF_PROMPT }],
-      maxTokens: 1000,
+      messages: [...toApiMessages(a.transcript, { annotateHints: true }), { role: "user", content: DEBRIEF_PROMPT }],
+      maxTokens: 2000,
     });
-    const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage };
+    const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason };
+    if (out.stop_reason === "max_tokens") debrief.truncated = true;
     const n = await store.appendTurn(a.id, a.transcript.length, [marker, debrief], out.model);
     if (n == null) fail(409, "Переписка изменилась, обновите страницу");
     await store.setStatus(a.id, "finished");

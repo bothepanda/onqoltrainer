@@ -76,6 +76,8 @@ ok((await call("POST", "start", { token: t2, body: { case_id: "fluids-01", mode:
 const rt = await call("POST", "start", { token: t1, body: { case_id: "fluids-01", mode: "retest" } });
 const rc = await call("POST", "chat", { token: t1, body: { attempt_id: rt.json.attempt.id, text: "Прошу подсказку", expected_len: 1 } });
 ok(rc.status === 200, "повтор стартует");
+const fin2 = await call("POST", "chat", { token: t1, body: { attempt_id: rt.json.attempt.id, text: "Завершить, дай разбор", expected_len: 3 } });
+ok(fin2.status === 200 && fin2.json.attempt?.status === "finished", "«Завершить, дай разбор» текстом завершает кейс, а не уходит в модель");
 
 // выгрузка
 const exp = await call("GET", "admin/export", { admin: ADMIN });
