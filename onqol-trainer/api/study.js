@@ -5,15 +5,21 @@ import { getStore } from "./_lib/db.js";
 import { hashPin, verifyPin, signToken, verifyToken, isAdmin, generatePin } from "./_lib/auth.js";
 import { CASES } from "./_lib/cases.generated.js";
 import { PLAN, MODE_OF_KIND, todayAlmaty } from "./_lib/plan.js";
-import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages, debriefFromGradingPrompt } from "./_lib/tutor.js";
+import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages, debriefFromGradingPrompt, hasEvalWords, REWRITE_NOTE, debriefFailed, isFinishText } from "./_lib/tutor.js";
 import { runGrader, finalizeGrading, compareGradings, gradingForDebrief, metricsOf, GRADER_VERSION } from "./_lib/grader.js";
 
 const MAX_TEXT = 4000;
 // Автоматическая оценка при завершении кейса включается только STUDY_GRADING=auto.
 // По умолчанию выключена: оценки загружаются из выгрузки (admin/grade-import) после занятия.
 const gradingMode = () => (process.env.STUDY_GRADING === "auto" ? "auto" : "off");
-// Явные команды завершения кейса, набранные текстом (кнопка «Завершить кейс» делает то же самое)
-const FINISH_RE = /^(конец кейса|завершить кейс|закончить кейс|завершить[, ]+дай разбор|дай разбор)[.!\s]*$/i;
+// Бюджет времени функции на Vercel (60 с): повторные запросы к модели делаются, только если осталось время
+const BUDGET_MS = 55000;
+// Суммируем числовые поля usage двух запросов (для стоимости в аудите)
+const sumUsage = (a = {}, b = {}) => {
+  const s = { ...b };
+  for (const k of Object.keys(a)) if (typeof a[k] === "number") s[k] = a[k] + (typeof b[k] === "number" ? b[k] : 0);
+  return s;
+};
 const MAX_TURNS = 60;
 const LOCK_AFTER = 5;
 const LOCK_MINUTES = 10;
@@ -193,18 +199,37 @@ const routes = {
     const expectedLen = Number(req.body?.expected_len);
     if (expectedLen !== a.transcript.length) fail(409, "Переписка изменилась, обновите страницу");
     if (a.transcript.filter((m) => m.role === "user").length >= MAX_TURNS) fail(429, "Достигнут лимит реплик. Завершите кейс");
-    if (FINISH_RE.test(text)) return routes["POST finish"](req, store);
+    // Текстовая команда завершить кейс (кнопка «Завершить кейс» делает то же самое)
+    if (isFinishText(text)) return routes["POST finish"](req, store);
 
     const kase = CASES[a.case_id];
     const userMsg = { role: "user", content: text, ts: new Date().toISOString() };
-    const out = await callModel({
-      system: buildSystemPrompt(kase, a.mode),
-      messages: toApiMessages([...a.transcript, userMsg]),
-      cacheConversation: true,
-      residentId: r.id,
-    });
+    const t0 = Date.now();
+    const system = buildSystemPrompt(kase, a.mode);
+    const messages = toApiMessages([...a.transcript, userMsg]);
+    let out = await callModel({ system, messages, cacheConversation: true, residentId: r.id });
+    let regen = false;
+    // Оценочные слова запрещены промптом, но модели иногда их пишут. Один повтор с пометкой, если хватает времени.
+    if (hasEvalWords(out.text) && Date.now() - t0 < 15000) {
+      try {
+        const retry = await callModel({
+          system,
+          messages: [...messages, { role: "assistant", content: out.text }, { role: "user", content: REWRITE_NOTE }],
+          timeoutMs: 20000,
+          retries: 0,
+          residentId: r.id,
+        });
+        if (retry.text && !hasEvalWords(retry.text)) {
+          out = { ...retry, usage: sumUsage(out.usage, retry.usage) };
+          regen = true;
+        }
+      } catch (err) {
+        console.error("rewrite failed:", err?.message);
+      }
+    }
     const { clean, hints } = parseHints(out.text);
     const reply = { role: "assistant", content: clean, ts: new Date().toISOString(), model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason };
+    if (regen) reply.regen = "eval_words";
     if (out.stop_reason === "max_tokens") reply.truncated = true;
     if (hints.length && a.mode === "tutored") reply.hints = hints;
     const n = await store.appendTurn(a.id, expectedLen, [userMsg, reply], out.model);
@@ -233,14 +258,20 @@ const routes = {
 
     // 2) разбор для резидента на основе оценки (или свободный, если оценка не получилась)
     const debriefPrompt = grading ? debriefFromGradingPrompt(gradingForDebrief(kase, grading, a.mode)) : DEBRIEF_PROMPT;
-    const out = await callModel({
-      system: buildSystemPrompt(kase, a.mode),
-      messages: [...toApiMessages(a.transcript, { annotateHints: true }), { role: "user", content: debriefPrompt }],
-      maxTokens: 2000,
-      timeoutMs: 25000,
-      retries: 0,
-      residentId: r.id,
-    });
+    const system = buildSystemPrompt(kase, a.mode);
+    // Служебные реплики «нажмите кнопку» в переписке модель копирует вместо разбора: из запроса разбора их убираем
+    const history = toApiMessages(a.transcript, { annotateHints: true }).filter((m) => !(m.role === "assistant" && m.content.length < 200 && /нажмите кнопку/i.test(m.content)));
+    const ask = (timeoutMs) => callModel({ system, messages: [...history, { role: "user", content: debriefPrompt }], maxTokens: 2000, timeoutMs, retries: 0, residentId: r.id });
+    const t0 = Date.now();
+    let out = await ask(25000);
+    // Разбор не получился (повтор фразы про кнопку или пустой ответ): один повтор, если хватает времени
+    if (debriefFailed(out.text) && Date.now() - t0 < 25000 && BUDGET_MS - (Date.now() - t0) > 10000) {
+      try {
+        out = await ask(BUDGET_MS - (Date.now() - t0));
+      } catch (err) {
+        console.error("debrief retry failed:", err?.message);
+      }
+    }
     const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason, graded: !!grading };
     if (out.stop_reason === "max_tokens") debrief.truncated = true;
     const n = await store.appendTurn(a.id, a.transcript.length, [marker, debrief], out.model);
