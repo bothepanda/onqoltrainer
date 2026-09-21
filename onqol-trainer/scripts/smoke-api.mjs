@@ -88,6 +88,24 @@ ok(retest && !retest.transcript.some((m) => m.hints), "в режиме повт�
 const csv = await call("GET", "admin/export?format=csv", { admin: ADMIN });
 ok(csv.text.replace(/^\uFEFF/, "").split("\n")[0].startsWith("resident_id,pgy") && csv.text.includes(aid), "выгрузка CSV");
 
+// оценка по рубрике (в тесте оценщик — заглушка)
+const gA = await call("GET", `admin/grading?attempt_id=${aid}`, { admin: ADMIN });
+ok(gA.status === 200 && gA.json.model && gA.json.rubric.length === 14 && gA.json.model.items.length === 14, "оценка создаётся автоматически при завершении (14 пунктов)");
+const it14 = gA.json.model.items.find((i) => i.n === 14);
+ok(it14.score === 0 && it14.flags.includes("evidence_not_found"), "выдуманная цитата не засчитывается кодом");
+ok(gA.json.model.items.find((i) => i.n === 1).score === 2 && gA.json.model.metrics.weighted > 0, "цитата из реплики резидента засчитывается, метрики посчитаны");
+const gB = await call("GET", `admin/grading?attempt_id=${rt.json.attempt.id}`, { admin: ADMIN });
+ok(gB.json.model.items.every((i) => i.score !== 1), "в повторе частичного балла нет");
+ok((await call("POST", "admin/grade-review", { admin: ADMIN, body: { attempt_id: rt.json.attempt.id, items: [{ n: 2, score: 1 }] } })).status === 400, "ручная проверка отклоняет балл 1 в повторе");
+const rev = await call("POST", "admin/grade-review", { admin: ADMIN, body: { attempt_id: aid, items: [{ n: 1, score: 1 }], flags: { c1: true }, note: "проверка" } });
+ok(rev.status === 200 && rev.json.grading.items.find((i) => i.n === 1).score === 1 && rev.json.grading.flags.c1.value, "ручная проверка сохраняется");
+const cmp = await call("GET", "admin/compare?include_test=1", { admin: ADMIN });
+const pair = cmp.json.pairs.find((p) => p.resident_id === ids.t1);
+ok(pair && pair.comparison.rows.length === 14 && pair.source.first === "human" && pair.source.retest === "model", "сравнение: проверенная человеком оценка важнее модели");
+ok(pair.comparison.counts && Object.keys(pair.comparison.counts).length > 0 && cmp.json.group.n >= 1, "сравнение: категории переходов и итог по группе");
+ok((await call("GET", "admin/compare", { admin: ADMIN })).json.pairs.every((p) => !p.resident_id.startsWith("T")), "тестовые ID по умолчанию исключены из сравнения");
+ok((await call("POST", "admin/grade", { admin: ADMIN, body: { attempt_id: aid } })).status === 200, "повторная оценка моделью по запросу администратора");
+
 // блокировка PIN
 for (let i = 0; i < 5; i++) await call("POST", "login", { body: { id: ids.t2, pin: "111111" } });
 ok((await call("POST", "login", { body: { id: ids.t2, pin: pin[ids.t2] } })).status === 429, "после 5 неверных PIN вход блокируется");

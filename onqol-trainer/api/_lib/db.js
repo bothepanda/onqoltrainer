@@ -35,6 +35,15 @@ function pgStore(url) {
         submitted_at timestamptz,
         UNIQUE (resident_id, case_id, mode)
       )`;
+      await sql`CREATE TABLE IF NOT EXISTS gradings (
+        attempt_id text NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        kind text NOT NULL,
+        result jsonb NOT NULL,
+        model text,
+        version text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (attempt_id, kind)
+      )`;
     },
     async getResident(id) {
       const r = await sql`SELECT * FROM residents WHERE id = ${id}`;
@@ -89,6 +98,15 @@ function pgStore(url) {
     },
     async deleteAttempt(id) {
       await sql`DELETE FROM attempts WHERE id = ${id}`;
+    },
+    async saveGrading(attemptId, kind, result, model, version) {
+      await sql`INSERT INTO gradings (attempt_id, kind, result, model, version)
+        VALUES (${attemptId}, ${kind}, ${JSON.stringify(result)}::jsonb, ${model}, ${version})
+        ON CONFLICT (attempt_id, kind) DO UPDATE SET result = EXCLUDED.result, model = EXCLUDED.model,
+        version = EXCLUDED.version, created_at = now()`;
+    },
+    async listGradings() {
+      return sql`SELECT attempt_id, kind, result, model, version, created_at FROM gradings`;
     },
   };
 }
@@ -164,7 +182,17 @@ function fileStore() {
     async deleteAttempt(id) {
       const d = load();
       delete d.attempts[id];
+      d.gradings = (d.gradings || []).filter((g) => g.attempt_id !== id);
       save(d);
+    },
+    async saveGrading(attemptId, kind, result, model, version) {
+      const d = load();
+      d.gradings = (d.gradings || []).filter((g) => !(g.attempt_id === attemptId && g.kind === kind));
+      d.gradings.push({ attempt_id: attemptId, kind, result, model, version, created_at: now() });
+      save(d);
+    },
+    async listGradings() {
+      return load().gradings || [];
     },
   };
 }

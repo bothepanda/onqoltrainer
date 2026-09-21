@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { api } from "./api";
 
 const box = { background: "#fff", border: "1px solid rgba(22,105,122,0.18)", borderRadius: 10, padding: 16, marginBottom: 14 };
@@ -7,12 +7,142 @@ const input = { width: "100%", boxSizing: "border-box", padding: "9px 10px", bor
 const th = { textAlign: "left", padding: "4px 8px", fontSize: 12, color: "#3a7a84", borderBottom: "1px solid #ddd" };
 const td = { padding: "4px 8px", fontSize: 13, borderBottom: "1px solid #eee" };
 
+
+const SCORE = { 2: "сам", 1: "после подсказки", 0: "нет" };
+const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
+
+function GradeView({ attemptId, token, onClose, onChanged }) {
+  const [d, setD] = useState(null);
+  const [edit, setEdit] = useState({});
+  const [flags, setFlags] = useState({ c1: false, c2: false });
+  const [note, setNote] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const apply = useCallback((r) => {
+    setD(r);
+    const src = r.human || r.model;
+    setEdit(Object.fromEntries((src?.items || []).map((i) => [i.n, i.score])));
+    setFlags({ c1: !!src?.flags?.c1?.value, c2: !!src?.flags?.c2?.value });
+    setNote(r.human?.note || "");
+  }, []);
+  const load = () => api("GET", `admin/grading?attempt_id=${attemptId}`, null, { admin: token }).then(apply);
+  useEffect(() => {
+    api("GET", `admin/grading?attempt_id=${attemptId}`, null, { admin: token }).then(apply).catch((e) => setMsg(e.message));
+  }, [attemptId, token, apply]);
+
+  const run = async (fn) => { setBusy(true); setMsg(""); try { await fn(); } catch (e) { setMsg(e.message); } finally { setBusy(false); } };
+  const gradeByModel = () => run(async () => { await api("POST", "admin/grade", { attempt_id: attemptId }, { admin: token }); await load(); onChanged(); });
+  const save = () => run(async () => {
+    await api("POST", "admin/grade-review", { attempt_id: attemptId, items: Object.entries(edit).map(([n, score]) => ({ n: Number(n), score })), flags, note }, { admin: token });
+    await load(); onChanged(); setMsg("Проверка сохранена");
+  });
+
+  if (!d) return <div style={box}>{msg || "Загрузка…"}</div>;
+  const retest = d.attempt.mode === "retest";
+  const m = d.model;
+  const modelItem = (n) => m?.items.find((i) => i.n === n);
+  const metrics = d.human?.metrics || m?.metrics;
+  return (
+    <div style={{ ...box, borderColor: "#16697A" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <b style={{ fontSize: 14 }}>{d.attempt.resident_id} · {d.attempt.case_id} v{d.attempt.case_version} · {retest ? "повтор" : "первое прохождение"}</b>
+        <span style={{ flex: 1 }} />
+        <button style={btn} disabled={busy} onClick={gradeByModel}>{m ? "Оценить заново моделью" : "Оценить моделью"}</button>
+        <button style={{ ...btn, background: "#666", marginRight: 0 }} onClick={onClose}>Закрыть</button>
+      </div>
+      {msg && <div style={{ color: msg.includes("сохранена") ? "#1b7a4b" : "#c0392b", fontSize: 13, marginTop: 8 }}>{msg}</div>}
+      {metrics && <div style={{ fontSize: 13, margin: "10px 0" }}>
+        {d.human ? "Проверено вами" : "Оценка модели, не проверена"}: самостоятельность {pct(metrics.independence)} · общий балл {pct(metrics.weighted)} · сам {metrics.self_items}, после подсказки {metrics.hint_items}, нет {metrics.missed_items}
+      </div>}
+      {!m && !d.human && <div style={{ fontSize: 13 }}>Оценки пока нет. Нажмите «Оценить моделью».</div>}
+      <details style={{ margin: "8px 0" }}>
+        <summary style={{ fontSize: 13, cursor: "pointer" }}>Переписка ({d.transcript.length})</summary>
+        <div style={{ fontSize: 12, maxHeight: 320, overflow: "auto", background: "#fafafa", padding: 8, marginTop: 6 }}>
+          {d.transcript.map((t, i) => (
+            <div key={i} style={{ marginBottom: 8, whiteSpace: "pre-wrap", color: t.role === "user" ? "#0d2124" : "#3a7a84" }}>
+              <b>#{i} {t.role === "user" ? "резидент" : "преподаватель"}{t.hints ? ` [подсказка: ${t.hints.map((h) => `п.${h.item} ур.${h.level}`).join(", ")}]` : ""}{t.truncated ? " [ОБРЕЗАНО]" : ""}:</b> {t.content}
+            </div>
+          ))}
+        </div>
+      </details>
+      {(m || d.human) && (
+        <>
+          <table style={{ borderCollapse: "collapse", width: "100%" }}>
+            <thead><tr><th style={th}>№</th><th style={th}>Пункт</th><th style={th}>Вес</th><th style={th}>Модель</th><th style={th}>Ваша оценка</th></tr></thead>
+            <tbody>{d.rubric.map((r) => {
+              const mi = modelItem(r.n);
+              return (
+                <tr key={r.n}>
+                  <td style={td}>{r.n}</td><td style={td}>{r.text}</td><td style={td}>{r.weight}</td>
+                  <td style={{ ...td, fontSize: 12 }}>
+                    {mi ? <><b>{SCORE[mi.score]}</b>{mi.hint_level ? ` (подск. ур.${mi.hint_level})` : ""}{mi.flags?.length ? ` ⚠ ${mi.flags.join(", ")}` : ""}{mi.evidence ? <div style={{ color: "#3a7a84" }}>«{mi.evidence}»</div> : null}</> : "—"}
+                  </td>
+                  <td style={td}>
+                    <select value={edit[r.n] ?? 0} onChange={(e) => setEdit({ ...edit, [r.n]: Number(e.target.value) })} style={{ fontFamily: "inherit", padding: 4 }}>
+                      <option value={2}>2 · сам</option>
+                      {!retest && <option value={1}>1 · после подсказки</option>}
+                      <option value={0}>0 · нет</option>
+                    </select>
+                  </td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+          <div style={{ margin: "10px 0", fontSize: 13 }}>
+            <label style={{ marginRight: 16 }}><input type="checkbox" checked={flags.c1} onChange={(e) => setFlags({ ...flags, c1: e.target.checked })} /> C1: диуретик до коррекции гиповолемии</label>
+            <label><input type="checkbox" checked={flags.c2} onChange={(e) => setFlags({ ...flags, c2: e.target.checked })} /> C2: болюсы при признаках перегрузки</label>
+          </div>
+          <input style={input} placeholder="Заметка (необязательно)" value={note} onChange={(e) => setNote(e.target.value)} />
+          <button style={{ ...btn, marginTop: 10 }} disabled={busy} onClick={save}>Сохранить мою проверку</button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function CompareView({ token }) {
+  const [d, setD] = useState(null);
+  const [includeTest, setIncludeTest] = useState(false);
+  const [msg, setMsg] = useState("");
+  const load = async () => { setMsg(""); try { setD(await api("GET", `admin/compare${includeTest ? "?include_test=1" : ""}`, null, { admin: token })); } catch (e) { setMsg(e.message); } };
+  return (
+    <div style={box}>
+      <b style={{ fontSize: 14 }}>Сравнение первого прохождения и повтора</b>
+      <div style={{ margin: "8px 0" }}>
+        <button style={btn} onClick={load}>Сравнить</button>
+        <label style={{ fontSize: 12 }}><input type="checkbox" checked={includeTest} onChange={(e) => setIncludeTest(e.target.checked)} /> включая тестовые ID (T…)</label>
+      </div>
+      {msg && <div style={{ color: "#c0392b", fontSize: 13 }}>{msg}</div>}
+      {d && (d.pairs.length === 0
+        ? <div style={{ fontSize: 13 }}>Пар с оценкой нет: нужны оба прохождения, завершённые и оценённые.</div>
+        : <>
+          <div style={{ fontSize: 13, margin: "6px 0" }}>Пар: {d.group.n} · самостоятельность {pct(d.group.independence.first)} → {pct(d.group.independence.retest)} · общий балл {pct(d.group.weighted.first)} → {pct(d.group.weighted.retest)}</div>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>Переходы (пунктов): {Object.entries(d.group.transitions).map(([k, v]) => `${k} ${v}`).join(" · ")}</div>
+          <table style={{ borderCollapse: "collapse", width: "100%" }}>
+            <thead><tr><th style={th}>Резидент</th><th style={th}>Год</th><th style={th}>Самост. 1-й → повтор</th><th style={th}>Общий балл</th><th style={th}>Переходы</th><th style={th}>Источник</th></tr></thead>
+            <tbody>{d.pairs.map((p) => (
+              <tr key={p.resident_id + p.case_id}>
+                <td style={td}>{p.resident_id}</td><td style={td}>{p.pgy ?? "—"}</td>
+                <td style={td}>{pct(p.comparison.first.independence)} → {pct(p.comparison.retest.independence)}</td>
+                <td style={td}>{pct(p.comparison.first.weighted)} → {pct(p.comparison.retest.weighted)}</td>
+                <td style={{ ...td, fontSize: 12 }}>{Object.entries(p.comparison.counts).map(([k, v]) => `${k} ${v}`).join(", ")}</td>
+                <td style={{ ...td, fontSize: 12 }}>{p.source.first === "human" ? "вы" : "модель"} / {p.source.retest === "human" ? "вы" : "модель"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </>)}
+    </div>
+  );
+}
+
 export default function AdminPanel() {
   const [token, setToken] = useState(() => { try { return sessionStorage.getItem("onqol_admin") || ""; } catch { return ""; } });
   const [data, setData] = useState(null);
   const [list, setList] = useState("R01:2\nR02:3\nR03:3\nR04:4\nR05:4\nR06:5\nR07:5\nR08:5");
   const [made, setMade] = useState(null);
   const [msg, setMsg] = useState("");
+  const [gradeOf, setGradeOf] = useState(null);
 
   const run = async (fn) => { setMsg(""); try { await fn(); } catch (e) { setMsg(e.message); } };
   const remember = () => { try { sessionStorage.setItem("onqol_admin", token); } catch { /* ignore */ } };
@@ -88,13 +218,16 @@ export default function AdminPanel() {
             <div style={box}>
               <b style={{ fontSize: 14 }}>Попытки ({data.attempts.length})</b>
               <table style={{ borderCollapse: "collapse", marginTop: 6, width: "100%" }}>
-                <thead><tr><th style={th}>Резидент</th><th style={th}>Кейс</th><th style={th}>Режим</th><th style={th}>Статус</th><th style={th}>Реплик</th><th style={th} /></tr></thead>
+                <thead><tr><th style={th}>Резидент</th><th style={th}>Кейс</th><th style={th}>Режим</th><th style={th}>Статус</th><th style={th}>Реплик</th><th style={th}>Оценка</th><th style={th} /></tr></thead>
                 <tbody>{data.attempts.map((a) => (
                   <tr key={a.id}><td style={td}>{a.resident_id}</td><td style={td}>{a.case_id} v{a.case_version}</td><td style={td}>{a.mode === "retest" ? "повтор" : "первый"}</td><td style={td}>{a.status}</td><td style={td}>{a.messages}</td>
+                    <td style={td}>{a.status === "draft" ? "—" : <button style={{ ...btn, padding: "3px 8px", fontSize: 11 }} onClick={() => setGradeOf(a.id)}>{a.graded.human ? "проверено" : a.graded.model ? "модель" : "оценить"}</button>}</td>
                     <td style={td}><button style={{ ...btn, background: "#8a3b3b", padding: "3px 8px", fontSize: 11 }} onClick={() => reset(a.id)}>сброс</button></td></tr>
                 ))}</tbody>
               </table>
             </div>
+            {gradeOf && <GradeView attemptId={gradeOf} token={token} onClose={() => setGradeOf(null)} onChanged={overview} />}
+            <CompareView token={token} />
           </>
         )}
       </div>

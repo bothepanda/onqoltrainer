@@ -5,7 +5,8 @@ import { getStore } from "./_lib/db.js";
 import { hashPin, verifyPin, signToken, verifyToken, isAdmin, generatePin } from "./_lib/auth.js";
 import { CASES } from "./_lib/cases.generated.js";
 import { PLAN, MODE_OF_KIND, todayAlmaty } from "./_lib/plan.js";
-import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages } from "./_lib/tutor.js";
+import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages, debriefFromGradingPrompt } from "./_lib/tutor.js";
+import { runGrader, compareGradings, gradingForDebrief, metricsOf, GRADER_VERSION } from "./_lib/grader.js";
 
 const MAX_TEXT = 4000;
 // Явные команды завершения кейса, набранные текстом (кнопка «Завершить кейс» делает то же самое)
@@ -103,6 +104,14 @@ async function ownAttempt(store, resident, id) {
   if (!a || a.resident_id !== resident.id) fail(404, "Попытка не найдена");
   return a;
 }
+
+async function gradingsByAttempt(store) {
+  const map = {};
+  for (const g of await store.listGradings()) (map[g.attempt_id] ||= {})[g.kind] = g;
+  return map;
+}
+// Проверенная человеком оценка важнее оценки модели
+const effectiveOf = (gs) => (gs?.human ? { kind: "human", result: gs.human.result } : gs?.model ? { kind: "model", result: gs.model.result } : null);
 
 function csvCell(v) {
   const s = v == null ? "" : String(v);
@@ -204,12 +213,25 @@ const routes = {
     if (a.status !== "draft") return { attempt: attemptView(a) };
     const kase = CASES[a.case_id];
     const marker = { role: "user", content: "[Кейс завершён резидентом]", ts: new Date().toISOString(), kind: "finish" };
+
+    // 1) независимая оценка по рубрике; при сбое разбор строится по старой схеме
+    let grading = null;
+    try {
+      const g = await runGrader(kase, a.mode, a.transcript);
+      await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
+      grading = g.result;
+    } catch (err) {
+      console.error("grader failed:", err?.message);
+    }
+
+    // 2) разбор для резидента на основе оценки (или свободный, если оценка не получилась)
+    const debriefPrompt = grading ? debriefFromGradingPrompt(gradingForDebrief(kase, grading, a.mode)) : DEBRIEF_PROMPT;
     const out = await callModel({
       system: buildSystemPrompt(kase, a.mode),
-      messages: [...toApiMessages(a.transcript, { annotateHints: true }), { role: "user", content: DEBRIEF_PROMPT }],
+      messages: [...toApiMessages(a.transcript, { annotateHints: true }), { role: "user", content: debriefPrompt }],
       maxTokens: 2000,
     });
-    const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason };
+    const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason, graded: !!grading };
     if (out.stop_reason === "max_tokens") debrief.truncated = true;
     const n = await store.appendTurn(a.id, a.transcript.length, [marker, debrief], out.model);
     if (n == null) fail(409, "Переписка изменилась, обновите страницу");
@@ -247,11 +269,13 @@ const routes = {
   async "GET admin/overview"(req, store) {
     const residents = await store.listResidents();
     const attempts = await store.listAttempts();
+    const gr = await gradingsByAttempt(store);
     return {
       residents,
       attempts: attempts.map((a) => ({
         id: a.id, resident_id: a.resident_id, case_id: a.case_id, case_version: a.case_version, mode: a.mode,
         status: a.status, messages: a.transcript.length, started_at: a.started_at, submitted_at: a.submitted_at,
+        graded: { model: !!gr[a.id]?.model, human: !!gr[a.id]?.human },
       })),
       cases: Object.values(CASES).map((c) => ({ id: c.id, version: c.version, hash: c.hash })),
       backend: store.kind,
@@ -278,6 +302,82 @@ const routes = {
     return {
       exported_at: new Date().toISOString(),
       attempts: attempts.map((a) => ({ ...a, pgy: residents[a.resident_id]?.pgy ?? null })),
+    };
+  },
+
+  async "POST admin/grade"(req, store) {
+    const a = await store.getAttempt(String(req.body?.attempt_id || ""));
+    if (!a) fail(404, "Попытка не найдена");
+    if (a.status === "draft") fail(409, "Попытка ещё не завершена");
+    const g = await runGrader(CASES[a.case_id], a.mode, a.transcript);
+    await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
+    return { grading: g.result };
+  },
+
+  async "GET admin/grading"(req, store) {
+    const a = await store.getAttempt(String(param(req, "attempt_id") || ""));
+    if (!a) fail(404, "Попытка не найдена");
+    const gs = (await gradingsByAttempt(store))[a.id] || {};
+    return {
+      attempt: { id: a.id, resident_id: a.resident_id, case_id: a.case_id, case_version: a.case_version, mode: a.mode, status: a.status },
+      rubric: CASES[a.case_id].rubric,
+      transcript: a.transcript,
+      model: gs.model?.result || null,
+      human: gs.human?.result || null,
+    };
+  },
+
+  // Ручная проверка: вы правите баллы модели. Проверенная оценка используется в сравнении вместо оценки модели.
+  async "POST admin/grade-review"(req, store) {
+    const a = await store.getAttempt(String(req.body?.attempt_id || ""));
+    if (!a) fail(404, "Попытка не найдена");
+    const kase = CASES[a.case_id];
+    const given = Array.isArray(req.body?.items) ? req.body.items : [];
+    const base = (await gradingsByAttempt(store))[a.id]?.model?.result;
+    const items = kase.rubric.map((r) => {
+      const g = given.find((x) => Number(x.n) === r.n);
+      const prev = base?.items.find((i) => i.n === r.n) || {};
+      const score = g && [0, 1, 2].includes(Number(g.score)) ? Number(g.score) : prev.score ?? 0;
+      if (a.mode === "retest" && score === 1) fail(400, `Пункт ${r.n}: в повторе возможны только 0 и 2`);
+      return { n: r.n, weight: r.weight, score, hint_level: Number(g?.hint_level ?? prev.hint_level) || 0, evidence: prev.evidence || "", evidence_msg: prev.evidence_msg ?? null, reason: String(g?.reason ?? prev.reason ?? ""), flags: [] };
+    });
+    const f = req.body?.flags || {};
+    const flags = { c1: { value: f.c1 === true, evidence: "" }, c2: { value: f.c2 === true, evidence: "" } };
+    const result = { version: "human-1", mode: a.mode, items, flags, metrics: metricsOf(items), note: String(req.body?.note || "").slice(0, 1000) };
+    await store.saveGrading(a.id, "human", result, "human", "human-1");
+    return { grading: result };
+  },
+
+  // Сравнение первого прохождения и повтора у каждого резидента (тестовые ID на T по умолчанию исключены)
+  async "GET admin/compare"(req, store) {
+    const includeTest = param(req, "include_test") === "1";
+    const residents = Object.fromEntries((await store.listResidents()).map((r) => [r.id, r]));
+    const attempts = await store.listAttempts();
+    const gr = await gradingsByAttempt(store);
+    const pairs = [];
+    for (const first of attempts.filter((x) => x.mode === "tutored")) {
+      if (!includeTest && first.resident_id.startsWith("T")) continue;
+      const retest = attempts.find((x) => x.mode === "retest" && x.resident_id === first.resident_id && x.case_id === first.case_id);
+      const e1 = effectiveOf(gr[first.id]);
+      const e2 = retest ? effectiveOf(gr[retest.id]) : null;
+      if (!retest || !e1 || !e2) continue;
+      pairs.push({
+        resident_id: first.resident_id, pgy: residents[first.resident_id]?.pgy ?? null, case_id: first.case_id,
+        source: { first: e1.kind, retest: e2.kind },
+        comparison: compareGradings(CASES[first.case_id], e1.result, e2.result),
+      });
+    }
+    const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+    const transitions = {};
+    for (const p of pairs) for (const [k, v] of Object.entries(p.comparison.counts)) transitions[k] = (transitions[k] || 0) + v;
+    return {
+      pairs,
+      group: {
+        n: pairs.length,
+        independence: { first: mean(pairs.map((p) => p.comparison.first.independence)), retest: mean(pairs.map((p) => p.comparison.retest.independence)) },
+        weighted: { first: mean(pairs.map((p) => p.comparison.first.weighted)), retest: mean(pairs.map((p) => p.comparison.retest.weighted)) },
+        transitions,
+      },
     };
   },
 
