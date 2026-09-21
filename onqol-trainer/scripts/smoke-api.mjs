@@ -85,15 +85,27 @@ const first = exp.json.attempts.find((a) => a.id === aid);
 ok(first && first.case_version && first.case_hash && first.transcript.some((m) => m.hints), "выгрузка JSON: версия и хэш кейса, метки подсказок");
 const retest = exp.json.attempts.find((a) => a.id === rt.json.attempt.id);
 ok(retest && !retest.transcript.some((m) => m.hints), "в режиме повтора подсказки не фиксируются");
+ok(exp.json.attempts.every((a) => "grading" in a), "выгрузка JSON содержит оценки (grading)");
 const csv = await call("GET", "admin/export?format=csv", { admin: ADMIN });
 ok(csv.text.replace(/^\uFEFF/, "").split("\n")[0].startsWith("resident_id,pgy") && csv.text.includes(aid), "выгрузка CSV");
 
 // оценка по рубрике (в тесте оценщик — заглушка)
+const ov = await call("GET", "admin/overview", { admin: ADMIN });
+const autoOn = ov.json.settings?.grading === "auto";
+console.log(`(автооценка на сервере: ${autoOn ? "включена" : "выключена"})`);
+if (!autoOn) {
+  const none = await call("GET", `admin/grading?attempt_id=${aid}`, { admin: ADMIN });
+  ok(none.json.model === null, "автооценка выключена: после завершения оценки нет");
+  const raw = { items: Array.from({ length: 14 }, (_, k) => ({ n: k + 1, score: k + 1 === 14 ? 2 : k % 2 ? 2 : 0, hint_level: 0, evidence: k % 2 || k + 1 === 14 ? (k + 1 === 14 ? "ЭТОЙ ЦИТАТЫ НЕТ" : "Прошу подсказку") : "", reason: "test" })), flags: { c1: { value: false }, c2: { value: false } } };
+  const imp = await call("POST", "admin/grade-import", { admin: ADMIN, body: { grader: "test-session", results: [{ attempt_id: aid, raw }, { attempt_id: rt.json.attempt.id, raw }] } });
+  ok(imp.status === 200 && imp.json.saved.length === 2, "загрузка оценок из файла: 2 попытки сохранены");
+  ok((await call("POST", "admin/grade-import", { admin: ADMIN, body: { results: [{ attempt_id: "нет-такой", raw }] } })).status === 404, "загрузка оценок: неизвестная попытка отклоняется");
+}
 const gA = await call("GET", `admin/grading?attempt_id=${aid}`, { admin: ADMIN });
-ok(gA.status === 200 && gA.json.model && gA.json.rubric.length === 14 && gA.json.model.items.length === 14, "оценка создаётся автоматически при завершении (14 пунктов)");
+ok(gA.status === 200 && gA.json.model && gA.json.rubric.length === 14 && gA.json.model.items.length === 14, autoOn ? "оценка создаётся автоматически при завершении (14 пунктов)" : "загруженная оценка читается (14 пунктов)");
 const it14 = gA.json.model.items.find((i) => i.n === 14);
 ok(it14.score === 0 && it14.flags.includes("evidence_not_found"), "выдуманная цитата не засчитывается кодом");
-ok(gA.json.model.items.find((i) => i.n === 1).score === 2 && gA.json.model.metrics.weighted > 0, "цитата из реплики резидента засчитывается, метрики посчитаны");
+ok(gA.json.model.items.find((i) => i.n === (autoOn ? 1 : 2)).score === 2 && gA.json.model.metrics.weighted > 0, "цитата из реплики резидента засчитывается, метрики посчитаны");
 const gB = await call("GET", `admin/grading?attempt_id=${rt.json.attempt.id}`, { admin: ADMIN });
 ok(gB.json.model.items.every((i) => i.score !== 1), "в повторе частичного балла нет");
 ok((await call("POST", "admin/grade-review", { admin: ADMIN, body: { attempt_id: rt.json.attempt.id, items: [{ n: 2, score: 1 }] } })).status === 400, "ручная проверка отклоняет балл 1 в повторе");

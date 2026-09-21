@@ -136,6 +136,32 @@ function CompareView({ token }) {
   );
 }
 
+function ImportView({ token, onDone }) {
+  const [msg, setMsg] = useState("");
+  const [ok, setOk] = useState(false);
+  const pick = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setMsg(""); setOk(false);
+    try {
+      const body = JSON.parse(await file.text());
+      const r = await api("POST", "admin/grade-import", body, { admin: token });
+      setOk(true);
+      setMsg(`Загружено оценок: ${r.saved.length}. ${r.saved.map((x) => `${x.resident_id} ${x.mode === "retest" ? "повтор" : "первый"} ${Math.round(x.independence * 100)}%`).join(" · ")}`);
+      onDone();
+    } catch (err) { setMsg(err.message); }
+  };
+  return (
+    <div style={box}>
+      <b style={{ fontSize: 14 }}>Загрузить оценки из файла</b>
+      <p style={{ fontSize: 12, color: "#3a7a84", margin: "6px 0 10px" }}>Файл gradings-import-….json, подготовленный после разбора выгрузки. Проверки (цитата есть в реплике резидента, понижение по метке подсказки, в повторе нет балла 1) применяются на сервере заново.</p>
+      <input type="file" accept=".json,application/json" onChange={pick} />
+      {msg && <div style={{ color: ok ? "#1b7a4b" : "#c0392b", fontSize: 13, marginTop: 8 }}>{msg}</div>}
+    </div>
+  );
+}
+
 export default function AdminPanel() {
   const [token, setToken] = useState(() => { try { return sessionStorage.getItem("onqol_admin") || ""; } catch { return ""; } });
   const [data, setData] = useState(null);
@@ -206,7 +232,7 @@ export default function AdminPanel() {
           <>
             <div style={box}>
               <b style={{ fontSize: 14 }}>Кейсы (версия и хэш пишутся в каждую попытку)</b>
-              <div style={{ fontSize: 13, marginTop: 6 }}>{data.cases.map((c) => `${c.id} v${c.version} #${c.hash}`).join(" · ")} · хранилище: {data.backend}</div>
+              <div style={{ fontSize: 13, marginTop: 6 }}>{data.cases.map((c) => `${c.id} v${c.version} #${c.hash}`).join(" · ")} · хранилище: {data.backend} · автооценка: {data.settings?.grading === "auto" ? "включена" : "выключена (оценки загружаются из файла)"}</div>
             </div>
             <div style={box}>
               <b style={{ fontSize: 14 }}>Резиденты ({data.residents.length})</b>
@@ -227,6 +253,7 @@ export default function AdminPanel() {
               </table>
             </div>
             {gradeOf && <GradeView attemptId={gradeOf} token={token} onClose={() => setGradeOf(null)} onChanged={overview} />}
+            <ImportView token={token} onDone={overview} />
             <CompareView token={token} />
           </>
         )}

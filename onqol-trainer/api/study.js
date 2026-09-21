@@ -6,9 +6,12 @@ import { hashPin, verifyPin, signToken, verifyToken, isAdmin, generatePin } from
 import { CASES } from "./_lib/cases.generated.js";
 import { PLAN, MODE_OF_KIND, todayAlmaty } from "./_lib/plan.js";
 import { PROMPT_VERSION, DEBRIEF_PROMPT, buildSystemPrompt, callModel, parseHints, toApiMessages, debriefFromGradingPrompt } from "./_lib/tutor.js";
-import { runGrader, compareGradings, gradingForDebrief, metricsOf, GRADER_VERSION } from "./_lib/grader.js";
+import { runGrader, finalizeGrading, compareGradings, gradingForDebrief, metricsOf, GRADER_VERSION } from "./_lib/grader.js";
 
 const MAX_TEXT = 4000;
+// Автоматическая оценка при завершении кейса включается только STUDY_GRADING=auto.
+// По умолчанию выключена: оценки загружаются из выгрузки (admin/grade-import) после занятия.
+const gradingMode = () => (process.env.STUDY_GRADING === "auto" ? "auto" : "off");
 // Явные команды завершения кейса, набранные текстом (кнопка «Завершить кейс» делает то же самое)
 const FINISH_RE = /^(конец кейса|завершить кейс|закончить кейс|завершить[, ]+дай разбор|дай разбор)[.!\s]*$/i;
 const MAX_TURNS = 60;
@@ -218,12 +221,14 @@ const routes = {
 
     // 1) независимая оценка по рубрике; при сбое разбор строится по старой схеме
     let grading = null;
-    try {
-      const g = await runGrader(kase, a.mode, a.transcript, { timeoutMs: 30000 });
-      await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
-      grading = g.result;
-    } catch (err) {
-      console.error("grader failed:", err?.message);
+    if (gradingMode() === "auto") {
+      try {
+        const g = await runGrader(kase, a.mode, a.transcript, { timeoutMs: 30000 });
+        await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
+        grading = g.result;
+      } catch (err) {
+        console.error("grader failed:", err?.message);
+      }
     }
 
     // 2) разбор для резидента на основе оценки (или свободный, если оценка не получилась)
@@ -284,6 +289,7 @@ const routes = {
       })),
       cases: Object.values(CASES).map((c) => ({ id: c.id, version: c.version, hash: c.hash })),
       backend: store.kind,
+      settings: { grading: gradingMode() },
     };
   },
 
@@ -304,9 +310,14 @@ const routes = {
       }
       return { __raw: "﻿" + rows.join("\n"), contentType: "text/csv; charset=utf-8" };
     }
+    const gr = await gradingsByAttempt(store);
     return {
       exported_at: new Date().toISOString(),
-      attempts: attempts.map((a) => ({ ...a, pgy: residents[a.resident_id]?.pgy ?? null })),
+      attempts: attempts.map((a) => ({
+        ...a,
+        pgy: residents[a.resident_id]?.pgy ?? null,
+        grading: { model: gr[a.id]?.model?.result || null, human: gr[a.id]?.human?.result || null },
+      })),
     };
   },
 
@@ -317,6 +328,26 @@ const routes = {
     const g = await runGrader(CASES[a.case_id], a.mode, a.transcript);
     await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
     return { grading: g.result };
+  },
+
+  // Загрузка оценок, сделанных вне сервера (например, в сессии Claude Code по выгрузке).
+  // Приходят «сырые» баллы и цитаты; проверки кодом (цитата есть в реплике резидента, понижение по метке подсказки,
+  // в повторе нет балла 1) применяются здесь заново, независимо от того, кто оценивал.
+  async "POST admin/grade-import"(req, store) {
+    const results = Array.isArray(req.body?.results) ? req.body.results : [];
+    if (!results.length) fail(400, "Передайте results: [{attempt_id, raw}]");
+    const label = String(req.body?.grader || "external").slice(0, 80);
+    const saved = [];
+    for (const r of results) {
+      const a = await store.getAttempt(String(r.attempt_id || ""));
+      if (!a) fail(404, `Попытка не найдена: ${r.attempt_id}`);
+      if (a.status === "draft") fail(409, `Попытка ещё не завершена: ${r.attempt_id}`);
+      const result = finalizeGrading(CASES[a.case_id], a.mode, a.transcript, r.raw);
+      result.version = `${GRADER_VERSION}-external`;
+      await store.saveGrading(a.id, "model", result, label, result.version);
+      saved.push({ attempt_id: a.id, resident_id: a.resident_id, mode: a.mode, independence: result.metrics.independence, weighted: result.metrics.weighted });
+    }
+    return { saved };
   },
 
   async "GET admin/grading"(req, store) {
