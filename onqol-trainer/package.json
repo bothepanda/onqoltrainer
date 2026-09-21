@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "node scripts/build-cases.mjs && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "cases": "node scripts/build-cases.mjs",
+    "dev:api": "node scripts/dev-api.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "@vercel/blob": "^0.27.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",

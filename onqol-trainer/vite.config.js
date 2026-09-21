@@ -6,6 +6,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
+      // локальный API учебных сессий: npm run dev:api (STUDY_MOCK=1 — заглушка вместо модели)
+      "/api/study": { target: "http://localhost:3001" },
       "/anthropic": {
         target: "https://api.anthropic.com",
         changeOrigin: true,
