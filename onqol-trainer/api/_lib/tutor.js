@@ -1,7 +1,18 @@
-// Преподаватель: сборка промпта из утверждённого кейса и вызов модели.
+// Преподаватель: сборка промпта из утверждённого кейса и вызов модели через официальный SDK.
+import Anthropic from "@anthropic-ai/sdk";
 
-export const PROMPT_VERSION = "study-1.1";
+export const PROMPT_VERSION = "study-1.2";
 export const DEFAULT_MODEL = "claude-sonnet-5";
+
+// Модель выбирается по роли: преподаватель (диалог и разбор) и оценщик могут работать на разных моделях.
+// STUDY_TUTOR_MODEL / STUDY_GRADER_MODEL задают роль отдельно, STUDY_MODEL сразу обе.
+// Пробный режим: тестовые ID, начинающиеся на TH (например TH1), ведёт преподаватель на STUDY_TRIAL_MODEL
+// (по умолчанию Haiku 4.5). Так две модели сравниваются на одной сборке и одном промпте, а настоящие резиденты не затрагиваются.
+export const TRIAL_MODEL_DEFAULT = "claude-haiku-4-5";
+export function modelFor(role, residentId = "") {
+  if (role === "tutor" && /^TH/i.test(residentId)) return process.env.STUDY_TRIAL_MODEL || TRIAL_MODEL_DEFAULT;
+  return (role === "grader" ? process.env.STUDY_GRADER_MODEL : process.env.STUDY_TUTOR_MODEL) || process.env.STUDY_MODEL || DEFAULT_MODEL;
+}
 
 const COMMON = `Ты — клинический преподаватель-хирург. Ведёшь разбор хирургического кейса с резидентом. Стиль строгий, но поддерживающий. Ты не читаешь лекции: задаёшь вопросы, слушаешь, выдаёшь данные пациента.
 
@@ -71,7 +82,13 @@ export function toApiMessages(transcript, { annotateHints = false } = {}) {
   return [{ role: "user", content: "Начни кейс." }, ...transcript.map((m) => ({ role: m.role, content: m.content + note(m) }))];
 }
 
-export async function callModel({ system, messages, maxTokens = 2000 }) {
+let client;
+const getClient = () => (client ||= new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }));
+
+// thinking: "disabled" отключает размышление (нужно оценщику: размышление делит с ответом один лимит токенов).
+// timeoutMs и retries выбираются под лимит функции на Vercel (60 с): худший случай = timeoutMs × (retries + 1).
+// temperature намеренно не поддерживается: на Sonnet 5 параметр возвращает 400.
+export async function callModel({ system, messages, maxTokens = 2000, thinking, timeoutMs = 25000, retries = 1, cacheConversation = false, role = "tutor", residentId = "" }) {
   if (process.env.STUDY_MOCK === "1") {
     const last = messages[messages.length - 1]?.content || "";
     if (system.includes("НЕЗАВИСИМЫЙ ОЦЕНЩИК")) {
@@ -87,27 +104,37 @@ export async function callModel({ system, messages, maxTokens = 2000 }) {
     const hint = /подсказ/i.test(last) ? "\n<<HINT item=3 level=1>>" : "";
     return { text: "[MOCK] Принято. Что делаете дальше?" + hint, model: "mock", usage: {}, stop_reason: "end_turn" };
   }
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error("ANTHROPIC_API_KEY не задан");
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY не задан");
   const body = {
-    model: process.env.STUDY_MODEL || DEFAULT_MODEL,
+    model: modelFor(role, residentId),
     max_tokens: maxTokens,
     // Досье одинаково во всех запросах попытки: кэшируем, чтобы платить за него один раз
     system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
     messages,
   };
-  if (process.env.STUDY_TEMPERATURE) body.temperature = Number(process.env.STUDY_TEMPERATURE);
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify(body),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data?.error?.message || `Ошибка модели: ${r.status}`);
+  if (thinking === "disabled") body.thinking = { type: "disabled" };
+  // Кэш переписки: точка кэширования на последней реплике. Следующий ход прочитает уже записанное
+  // (в 10 раз дешевле обычного входа) и запишет только два новых сообщения. Только для хода диалога:
+  // у оценщика и разбора переписка уходит один раз, кэшировать её невыгодно.
+  if (cacheConversation && messages.length) {
+    const last = messages[messages.length - 1];
+    const text = typeof last.content === "string" ? last.content : "";
+    body.messages = [...messages.slice(0, -1), { role: last.role, content: [{ type: "text", text, cache_control: { type: "ephemeral" } }] }];
+  }
+  let msg;
+  try {
+    msg = await getClient().messages.create(body, { timeout: timeoutMs, maxRetries: retries });
+  } catch (err) {
+    if (err instanceof Anthropic.APIConnectionTimeoutError) throw new Error("Модель не ответила вовремя", { cause: err });
+    if (err instanceof Anthropic.RateLimitError) throw new Error("Лимит запросов к модели, повторите через минуту", { cause: err });
+    if (err instanceof Anthropic.APIError) throw new Error(`Ошибка модели ${err.status}: ${err.message}`, { cause: err });
+    throw err;
+  }
+  if (msg.stop_reason === "refusal") throw new Error("Модель отклонила запрос (refusal)");
   return {
-    text: (data.content || []).map((b) => b.text || "").join(""),
-    model: data.model || body.model,
-    usage: data.usage || {},
-    stop_reason: data.stop_reason || null,
+    text: msg.content.filter((b) => b.type === "text").map((b) => b.text).join(""),
+    model: msg.model,
+    usage: msg.usage || {},
+    stop_reason: msg.stop_reason || null,
   };
 }

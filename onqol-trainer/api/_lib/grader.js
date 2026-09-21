@@ -2,7 +2,7 @@
 // Модель предлагает оценку с цитатами, КОД проверяет цитаты и понижает завышенные баллы.
 import { callModel } from "./tutor.js";
 
-export const GRADER_VERSION = "grade-1.1";
+export const GRADER_VERSION = "grade-1.2";
 
 const RULES = `Ты — НЕЗАВИСИМЫЙ ОЦЕНЩИК клинической работы резидента. Ты не преподаватель и не обращаешься к резиденту. Оцени, что резидент сделал в переписке, по рубрике кейса.
 
@@ -10,14 +10,14 @@ const RULES = `Ты — НЕЗАВИСИМЫЙ ОЦЕНЩИК клиническ
 - Оценивай ТОЛЬКО реплики резидента (метка РЕЗИДЕНТ). Реплики преподавателя — контекст. Данные, которые преподаватель выдал по запросу резидента, — не подсказка; сам запрос резидента (например, «проверить вены шеи») — его действие.
 - Счёт пункта: 2 = резидент назвал или сделал это САМ, до того как преподаватель упомянул тему или задал наводящий вопрос; 1 = только после наводящего вопроса, подсказки или готовой интерпретации преподавателя; 0 = не сделал, сделал неверно, или сказал только после того, как преподаватель сам назвал ответ. В режиме ПОВТОР допустимы только 0 и 2.
 - Подсказкой считается любая реплика преподавателя, наводящая на пункт или раскрывающая его (вопрос «а вы проверили X?», выбор из вариантов, готовый расчёт или вывод), даже без пометки.
-- Для каждого пункта со счётом 1 или 2 обязательна ЦИТАТА: точная подстрока из реплики РЕЗИДЕНТА (до 300 символов), подтверждающая пункт. Не перефразируй и не склеивай. Если цитаты нет — счёт 0.
+- Для каждого пункта со счётом 1 или 2 обязательна ЦИТАТА: точная подстрока из реплики РЕЗИДЕНТА (до 200 символов), подтверждающая пункт. Не перефразируй и не склеивай. Если цитаты нет — счёт 0.
 - Не засчитывай отсутствие ошибки как выполнение. Не засчитывай то, что резидент лишь повторил за преподавателем после его объяснения.
 - Пункты, сформулированные как воздержание от действия (например, «не использует диуретик как лечение гиповолемической олигурии»): 2 ставь только если резидент ЯВНО отказался от этого действия или ЯВНО назвал верную альтернативу как лечение причины (например, сказал, что олигурия здесь следствие гиповолемии и лечится оценкой перфузии и объёмом). Если резидент об этом просто не говорил, счёт 0: молчание не засчитывается. Если он выполнил запрещённое действие, счёт 0 и поставь соответствующий флаг критической ошибки. 1 — если явный отказ или альтернатива прозвучали только после наводящего вопроса.
 - hint_level: наибольший уровень подсказки по этому пункту (0 — не было; 1 — общий наводящий вопрос; 2 — прямой вопрос о пропущенном; 3 — прямое указание или готовая интерпретация).
 - Флаги критических ошибок (отдельно от баллов): c1 — резидент назначил диуретик (в том числе фуросемид) до оценки или коррекции подозреваемой гиповолемии; c2 — резидент продолжил повторные болюсы после появления признаков перегрузки. Для каждого дай value (true/false) и краткое evidence (цитата или пустая строка).
 
 Верни ТОЛЬКО один JSON без комментариев и без markdown, строго в формате:
-{"items":[{"n":1,"score":0,"hint_level":0,"evidence":"","reason":"одно короткое предложение"}, ...по одному объекту на каждый пункт рубрики...],"flags":{"c1":{"value":false,"evidence":""},"c2":{"value":false,"evidence":""}}}`;
+{"items":[{"n":1,"score":0,"hint_level":0,"evidence":"","reason":"до 12 слов"}, ...по одному объекту на каждый пункт рубрики...],"flags":{"c1":{"value":false,"evidence":""},"c2":{"value":false,"evidence":""}}}`;
 
 export function buildGraderSystem(kase, mode) {
   const rubric = kase.rubric.map((r) => `${r.n}. ${r.text} (вес ${r.weight})`).join("\n");
@@ -43,10 +43,15 @@ export function transcriptForGrader(transcript) {
 }
 
 export function extractJson(text) {
-  const a = text.indexOf("{");
-  const b = text.lastIndexOf("}");
-  if (a === -1 || b <= a) throw new Error("Оценщик вернул ответ без JSON");
-  return JSON.parse(text.slice(a, b + 1));
+  const t = String(text || "").replace(/```(?:json)?/gi, "");
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a === -1 || b <= a) throw new Error(`Оценщик вернул ответ без JSON. Начало ответа: «${t.slice(0, 200)}»`);
+  try {
+    return JSON.parse(t.slice(a, b + 1));
+  } catch (e) {
+    throw new Error(`Оценщик вернул некорректный JSON (${e.message}). Начало ответа: «${t.slice(a, a + 200)}»`, { cause: e });
+  }
 }
 
 const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -55,8 +60,9 @@ const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
 // в повторе частичный балл невозможен.
 export function finalizeGrading(kase, mode, transcript, raw) {
   const residentMsgs = transcript.map((m, i) => ({ m, i })).filter(({ m }) => m.role === "user" && !m.kind);
+  const rawItems = Array.isArray(raw?.items) ? raw.items : [];
   const items = kase.rubric.map((r) => {
-    const g = (raw.items || []).find((x) => Number(x.n) === r.n) || {};
+    const g = rawItems.find((x) => Number(x.n) === r.n) || {};
     let score = [0, 1, 2].includes(Number(g.score)) ? Number(g.score) : 0;
     const flags = [];
     const evidence = String(g.evidence || "").slice(0, 400);
@@ -79,7 +85,7 @@ export function finalizeGrading(kase, mode, transcript, raw) {
   });
   const flagsOut = {};
   for (const k of ["c1", "c2"]) {
-    const f = raw.flags?.[k] || {};
+    const f = raw?.flags?.[k] || {};
     flagsOut[k] = { value: f.value === true, evidence: String(f.evidence || "").slice(0, 400) };
   }
   return { version: GRADER_VERSION, mode, items, flags: flagsOut, metrics: metricsOf(items) };
@@ -96,12 +102,21 @@ export function metricsOf(items) {
   };
 }
 
-export async function runGrader(kase, mode, transcript) {
+// Размышление отключено: у Sonnet 5 оно делит с ответом лимит токенов и в прошлом запуске съело его целиком до JSON.
+// Качество держат явные правила, обязательные цитаты и проверки кодом.
+export async function runGrader(kase, mode, transcript, { timeoutMs = 45000 } = {}) {
   const out = await callModel({
     system: buildGraderSystem(kase, mode),
     messages: [{ role: "user", content: `ПЕРЕПИСКА:\n\n${transcriptForGrader(transcript)}\n\nВерни JSON оценки.` }],
-    maxTokens: 4000,
+    maxTokens: 6000,
+    thinking: "disabled",
+    role: "grader",
+    timeoutMs,
+    retries: 0,
   });
+  if (out.stop_reason === "max_tokens") {
+    throw new Error("Ответ оценщика обрезан по лимиту токенов (max_tokens). Увеличьте лимит или сократите переписку.");
+  }
   const result = finalizeGrading(kase, mode, transcript, extractJson(out.text));
   return { result, model: out.model };
 }

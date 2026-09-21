@@ -10,6 +10,23 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const casesDir = join(root, "cases");
 const outFile = join(root, "api", "_lib", "cases.generated.js");
 
+function trimDossier(text, file) {
+  const out = text
+    .replace(/\*\*Гайдлайны и статус проверки:\*\*[\s\S]*?(?=\n---\n)/, "")
+    .replace(/### Спорные места учебника[\s\S]*?(?=\n---\n|\n## )/, "")
+    .replace(/### Что сохраняется по каждому пункту и попытке[\s\S]*?(?=\n### |\n## |\n---\n)/, "")
+    .replace(/### Переходы между попыткой 1 и повтором[\s\S]*?(?=\n---\n|\n## |$)/, "")
+    .replace(/## Часть D\.[\s\S]*?(?=\n---\n|\n## |$)/, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  // Страховка: без этих разделов преподаватель работать не сможет
+  for (const need of ["### Данные, которые преподаватель выдаёт", "### Ответы на действия резидента", "### Формуляр вашей клиники", "## Часть C. Рубрика", "### Критические флаги", "### Вопросы, которые задаёт преподаватель"]) {
+    if (!out.includes(need)) throw new Error(`${file}: в досье преподавателя пропал раздел «${need}»`);
+  }
+  console.log(`${file}: досье преподавателя ${text.length} → ${out.length} символов (${Math.round((1 - out.length / text.length) * 100)}% короче)`);
+  return out;
+}
+
 const cases = {};
 for (const file of readdirSync(casesDir).filter((f) => f.endsWith(".md")).sort()) {
   const md = readFileSync(join(casesDir, file), "utf8");
@@ -22,8 +39,9 @@ for (const file of readdirSync(casesDir).filter((f) => f.endsWith(".md")).sort()
   const id = head[1];
   // Преподавателю отдаём карточку, кейс, формуляр, рубрику и режимы.
   // Близнец и история версий ему не нужны.
+  // Из досье убираем то, что нужно автору и аналитике, но не преподавателю и оценщику (файл кейса не меняется).
   const cut = md.search(/^## Часть E\./m);
-  const dossier = (cut === -1 ? md : md.slice(0, cut)).trim();
+  const dossier = trimDossier((cut === -1 ? md : md.slice(0, cut)).trim(), file);
   // Рубрика: строки таблицы «| № | Пункт | Вес |» из части C — единственный источник истины для оценки
   const cStart = md.search(/^## Часть C\./m);
   const cEnd = md.search(/^### Критические флаги/m);

@@ -1,6 +1,7 @@
 // Логика оценки без модели: node scripts/test-grader.mjs
-import { finalizeGrading, transitionName, metricsOf } from "../api/_lib/grader.js";
+import { finalizeGrading, transitionName, metricsOf, extractJson } from "../api/_lib/grader.js";
 import { CASES } from "../api/_lib/cases.generated.js";
+import { modelFor } from "../api/_lib/tutor.js";
 
 let fails = 0;
 const ok = (c, n) => { console.log(`${c ? "ok  " : "FAIL"} ${n}`); if (!c) fails++; };
@@ -45,6 +46,20 @@ ok(Math.abs(w2.weighted - 3 / 27) < 1e-9, "только болюс (вес 3): 3
 
 const pairs = [[2, 2, "удержано"], [2, 0, "потеряно"], [1, 2, "закреплено после подсказки"], [1, 0, "не закреплено после подсказки"], [0, 2, "усвоено"], [0, 0, "не усвоено"]];
 ok(pairs.every(([a, b, n]) => transitionName(a, b) === n), "шесть категорий перехода между попытками");
+
+ok(extractJson('Вот оценка:\n```json\n{"items":[],"flags":{}}\n```\nготово').items.length === 0, "JSON достаётся из ответа с markdown-обёрткой и лишним текстом");
+let msg = ""; try { extractJson("нет json"); } catch (e) { msg = e.message; }
+ok(msg.includes("без JSON"), "ответ без JSON даёт понятную ошибку");
+msg = ""; try { extractJson('{"items":[{"n":1,"evidence":"обрыв'); } catch (e) { msg = e.message; }
+ok(msg.includes("без JSON") || msg.includes("некорректный JSON"), "обрезанный JSON даёт понятную ошибку");
+ok(finalizeGrading(kase, "tutored", T, { items: "не массив" }).items.length === 14, "items не массивом не ломает разбор");
+ok(finalizeGrading(kase, "tutored", T, null).items.length === 14, "пустой ответ не ломает разбор");
+
+delete process.env.STUDY_MODEL; delete process.env.STUDY_TUTOR_MODEL; delete process.env.STUDY_GRADER_MODEL; delete process.env.STUDY_TRIAL_MODEL;
+ok(modelFor("tutor", "R01") === "claude-sonnet-5" && modelFor("grader", "R01") === "claude-sonnet-5", "обычный резидент: Sonnet 5 для преподавателя и оценщика");
+ok(modelFor("tutor", "TH1") === "claude-haiku-4-5" && modelFor("tutor", "th2") === "claude-haiku-4-5", "тестовый ID на TH: преподаватель на Haiku 4.5");
+ok(modelFor("grader", "TH1") === "claude-sonnet-5", "оценщик у TH остаётся на Sonnet (сравнивается только преподаватель)");
+ok(modelFor("tutor", "T01") === "claude-sonnet-5" && modelFor("tutor", "R05") === "claude-sonnet-5", "прочие тестовые и настоящие ID не затронуты");
 
 console.log(fails ? `\n${fails} тест(ов) не прошло` : "\nВсе проверки пройдены");
 process.exit(fails ? 1 : 0);

@@ -197,6 +197,8 @@ const routes = {
     const out = await callModel({
       system: buildSystemPrompt(kase, a.mode),
       messages: toApiMessages([...a.transcript, userMsg]),
+      cacheConversation: true,
+      residentId: r.id,
     });
     const { clean, hints } = parseHints(out.text);
     const reply = { role: "assistant", content: clean, ts: new Date().toISOString(), model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason };
@@ -217,7 +219,7 @@ const routes = {
     // 1) независимая оценка по рубрике; при сбое разбор строится по старой схеме
     let grading = null;
     try {
-      const g = await runGrader(kase, a.mode, a.transcript);
+      const g = await runGrader(kase, a.mode, a.transcript, { timeoutMs: 30000 });
       await store.saveGrading(a.id, "model", g.result, g.model, GRADER_VERSION);
       grading = g.result;
     } catch (err) {
@@ -230,6 +232,9 @@ const routes = {
       system: buildSystemPrompt(kase, a.mode),
       messages: [...toApiMessages(a.transcript, { annotateHints: true }), { role: "user", content: debriefPrompt }],
       maxTokens: 2000,
+      timeoutMs: 25000,
+      retries: 0,
+      residentId: r.id,
     });
     const debrief = { role: "assistant", content: parseHints(out.text).clean, ts: new Date().toISOString(), kind: "debrief", model: out.model, prompt_version: PROMPT_VERSION, usage: out.usage, stop_reason: out.stop_reason, graded: !!grading };
     if (out.stop_reason === "max_tokens") debrief.truncated = true;
@@ -413,6 +418,8 @@ export default async function handler(req, res) {
   } catch (err) {
     if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
     console.error("study api error:", err?.message);
-    return res.status(500).json({ error: "Внутренняя ошибка сервера" });
+    // Администратору показываем настоящую причину, резиденту нет
+    const isAdminRoute = String(routeOf(req)).startsWith("admin/") && isAdmin(req);
+    return res.status(500).json({ error: isAdminRoute ? `Ошибка: ${err?.message}` : "Внутренняя ошибка сервера" });
   }
 }
