@@ -241,8 +241,9 @@ const routes = {
     const r = await authResident(req, store);
     const a = await ownAttempt(store, r, req.body?.attempt_id);
     if (a.status !== "draft") return { attempt: attemptView(a) };
+    const tFinish = Date.now();
     const kase = CASES[a.case_id];
-    const marker = { role: "user", content: "[Кейс завершён резидентом]", ts: new Date().toISOString(), kind: "finish" };
+    const marker ={ role: "user", content: "[Кейс завершён резидентом]", ts: new Date().toISOString(), kind: "finish" };
 
     // 1) независимая оценка по рубрике; при сбое разбор строится по старой схеме
     let grading = null;
@@ -262,12 +263,12 @@ const routes = {
     // Служебные реплики «нажмите кнопку» в переписке модель копирует вместо разбора: из запроса разбора их убираем
     const history = toApiMessages(a.transcript, { annotateHints: true }).filter((m) => !(m.role === "assistant" && m.content.length < 200 && /нажмите кнопку/i.test(m.content)));
     const ask = (timeoutMs) => callModel({ system, messages: [...history, { role: "user", content: debriefPrompt }], maxTokens: 2000, timeoutMs, retries: 0, residentId: r.id });
-    const t0 = Date.now();
-    let out = await ask(25000);
-    // Разбор не получился (повтор фразы про кнопку или пустой ответ): один повтор, если хватает времени
-    if (debriefFailed(out.text) && Date.now() - t0 < 25000 && BUDGET_MS - (Date.now() - t0) > 10000) {
+    // Разбор длиннее (до 400 слов): первому запросу даём до 40 с, но не больше, чем осталось от бюджета функции после оценки
+    let out = await ask(Math.min(40000, BUDGET_MS - (Date.now() - tFinish)));
+    // Разбор не получился (повтор фразы про кнопку, отказ или пустой ответ): один повтор, если хватает времени
+    if (debriefFailed(out.text) && BUDGET_MS - (Date.now() - tFinish) > 15000) {
       try {
-        out = await ask(BUDGET_MS - (Date.now() - t0));
+        out = await ask(BUDGET_MS - (Date.now() - tFinish));
       } catch (err) {
         console.error("debrief retry failed:", err?.message);
       }

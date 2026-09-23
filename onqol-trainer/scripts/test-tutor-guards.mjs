@@ -13,7 +13,11 @@ for (const mode of ["tutored", "retest"]) {
   assert.ok(!deb.includes("Не давай разбор, оценку или итог в чате") && deb.includes("этап итогового разбора"), "разбор: запрет заменён");
   assert.ok(deb.includes("ДОСЬЕ"), "досье сохранено");
 }
-for (const p of [DEBRIEF_PROMPT, debriefFromGradingPrompt("{}")]) assert.ok(!/служебн\S* запрос/i.test(p), "нет фальшивых служебных оговорок в сообщении пользователя");
+for (const p of [DEBRIEF_PROMPT, debriefFromGradingPrompt("{}")]) {
+  assert.ok(!/служебн\S* запрос/i.test(p), "нет фальшивых служебных оговорок в сообщении пользователя");
+  assert.ok(p.includes("KDIGO") && p.includes("SBAR") && p.includes("400 слов"), "разбор включает обучающий блок");
+}
+assert.ok(debriefFromGradingPrompt('{"x":1}').includes('{"x":1}'), "результат оценки передан");
 
 // Оценочные слова в начале предложения
 for (const t of ["Хорошо. Что дальше?", "Верно, диурез восстановился.", "Принято. Именно так.", "Отлично!", "Принято.\nПравильно, продолжайте.", "Согласен."]) {
