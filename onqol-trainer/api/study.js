@@ -258,7 +258,7 @@ const routes = {
 
     // 2) разбор для резидента на основе оценки (или свободный, если оценка не получилась)
     const debriefPrompt = grading ? debriefFromGradingPrompt(gradingForDebrief(kase, grading, a.mode)) : DEBRIEF_PROMPT;
-    const system = buildSystemPrompt(kase, a.mode);
+    const system = buildSystemPrompt(kase, a.mode, { debrief: true });
     // Служебные реплики «нажмите кнопку» в переписке модель копирует вместо разбора: из запроса разбора их убираем
     const history = toApiMessages(a.transcript, { annotateHints: true }).filter((m) => !(m.role === "assistant" && m.content.length < 200 && /нажмите кнопку/i.test(m.content)));
     const ask = (timeoutMs) => callModel({ system, messages: [...history, { role: "user", content: debriefPrompt }], maxTokens: 2000, timeoutMs, retries: 0, residentId: r.id });
